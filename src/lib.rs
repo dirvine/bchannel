@@ -1,4 +1,4 @@
-use std::sync::{mpsc, RwLock};
+use std::sync::mpsc;
 use std::cell::Cell;
 
 #[cfg(test)]
@@ -7,12 +7,6 @@ mod test;
 pub enum CommMsg<T, E> {
     Message(T),
     Error(E),
-}
-
-#[allow(dead_code)]
-enum MaybeOwned<'a, A: 'a> {
-    Owned(A),
-    Borrowed(&'a A)
 }
 
 /// The sending end of the channel.
@@ -24,8 +18,7 @@ pub struct Sender<T : Send, E : Send> {
 /// The receiving end of the channel.
 pub struct Receiver<T : Send, E : Send> {
     closed: Cell<bool>,
-    errored: Cell<bool>,
-    error: RwLock<Option<E>>,
+    error: Option<E>,
     inner: mpsc::Receiver<CommMsg<T, E>>
 }
 
@@ -36,24 +29,15 @@ pub struct Receiver<T : Send, E : Send> {
 ///
 /// This struct can either block when waiting for a message, or it can finish
 /// early (and be reusable) when it runs out of messages in the queue.
-pub struct ReceiverIterator<'a, T: Send + 'a, E: Send + 'a> {
-    reference: MaybeOwned<'a, Receiver<T, E>>,
+pub struct ReceiverIterator<T: Send, E: Send> {
+    reference: Receiver<T, E>,
     blocking: bool
-}
-
-impl <'a, A> MaybeOwned<'a A> {
-    fn borrow<'b: 'a>(&'b self) -> &'b A  {
-        match *self {
-            MaybeOwned::Owned(ref a) => a,
-            MaybeOwned::Borrowed(a) => a
-        }
-    }
 }
 
 /// Returns a Sender-Receiver pair sending messages of type T, and
 /// can fail with an error of type E.
 pub fn channel<T, E>() -> (Sender<T, E>, Receiver<T, E>)
-where T: Send + 'static, E: Send + Sync + 'static{
+where T: Send + 'static, E: Send + 'static{
     let (tx, rx) = mpsc::channel();
     (Sender::from_old(tx), Receiver::from_old(rx))
 }
@@ -137,22 +121,20 @@ where T: Send + 'static, E: Send + 'static {
 }
 
 impl <T, E> Receiver<T, E>
-where T: Send + 'static, E: Send + Sync + 'static {
+where T: Send + 'static, E: Send + 'static {
     /// Converts an old-style receiver to a bchannel receiver.
     pub fn from_old(v: mpsc::Receiver<CommMsg<T, E>>) -> Receiver<T, E> {
         Receiver {
             closed: Cell::new(false),
-            errored: Cell::new(false),
-            error: RwLock::new(None),
+            error: None,
             inner: v
         }
     }
 
     /// Returns the old-style receiver along with the error.
     /// The error will be None unless this channel was closed by an error.
-    pub fn into_inner(self) -> (mpsc::Receiver<CommMsg<T, E>>, Option<E>) {
-        let mut error_guard = self.error.write().unwrap();
-        (self.inner, error_guard.take())
+    pub fn into_inner(mut self) -> (mpsc::Receiver<CommMsg<T, E>>, Option<E>) {
+        (self.inner, self.error.take())
     }
 
     /// Returns the next message asyncrhonously.
@@ -161,16 +143,15 @@ where T: Send + 'static, E: Send + Sync + 'static {
     /// * If there is no message ready, None is returned.
     /// * If the channel is closed, None is returned.
     /// * If the channel is closed with an error, None is returned.
-    pub fn recv(&self) -> Option<T> {
+    pub fn recv(&mut self) -> Option<T> {
         if self.is_closed() {
             return None
         }
         match self.inner.try_recv() {
             Ok(CommMsg::Message(m)) => Some(m),
             Ok(CommMsg::Error(e)) => {
-                * self.error.write().unwrap() = Some(e);
+                self.error = Some(e);
                 self.closed.set(true);
-                self.errored.set(true);
                 None
             }
             Err(mpsc::TryRecvError::Empty) => None,
@@ -188,16 +169,15 @@ where T: Send + 'static, E: Send + Sync + 'static {
     /// * If a message arrives, the message is returned inside of `Some`.
     /// * If the channel is closed, `None` is returned.
     /// * If the channel is closed with an error, `None` is returned.
-    pub fn recv_block(&self) -> Option<T> {
+    pub fn recv_block(&mut self) -> Option<T> {
         if self.is_closed() {
             return None
         }
         match self.inner.recv() {
             Ok(CommMsg::Message(m)) => Some(m),
             Ok(CommMsg::Error(e)) => {
-                * self.error.write().unwrap() = Some(e);
+                self.error = Some(e);
                 self.closed.set(true);
-                self.errored.set(true);
                 None
             }
             Err(mpsc::RecvError) => {
@@ -209,7 +189,7 @@ where T: Send + 'static, E: Send + Sync + 'static {
 
     /// Returns true if the channel was closed with an error.
     pub fn has_error(&self) -> bool {
-        self.errored.get()
+        self.error.is_some()
     }
 
     /// Returns the error if the channel was closed with an error.
@@ -218,9 +198,8 @@ where T: Send + 'static, E: Send + Sync + 'static {
     ///
     /// Returns `None` if the channel wasn't closed with an error, or if
     /// the error has already been taken.
-    pub fn take_error(&self) -> Option<E> {
-        self.errored.set(false);
-        self.error.write().unwrap().take()
+    pub fn take_error(&mut self) -> Option<E> {
+        self.error.take()
     }
 
     /// Returns true if the channel is closed.
@@ -229,50 +208,32 @@ where T: Send + 'static, E: Send + Sync + 'static {
     }
 
     /// Returns an iterator over the messages in this receiver.
-    /// The iterator is non-blocking, and borrows this receiver.
-    pub fn iter(&self) -> ReceiverIterator<T, E> {
-        ReceiverIterator {
-            blocking: false,
-            reference: MaybeOwned::Borrowed(self)
-        }
-    }
-
-    /// Returns an iterator over the messages in this receiver.
-    /// The iterator is blocking and borrows this receiver.
-    pub fn blocking_iter(&self) -> ReceiverIterator<T, E> {
-        ReceiverIterator {
-            blocking: true,
-            reference: MaybeOwned::Borrowed(self)
-        }
-    }
-
-    /// Returns an iterator over the messages in this receiver.
     /// The iterator is non-blocking and consumes this receiver.
-    pub fn into_iter(self) -> ReceiverIterator<'static, T, E> {
+    pub fn into_iter(self) -> ReceiverIterator<T, E> {
         ReceiverIterator {
             blocking: false,
-            reference: MaybeOwned::Owned(self)
+            reference: self
         }
     }
 
     /// Returns an iterator over the messages in this receiver.
     /// The iterator is blocking, and consumes this receiver.
-    pub fn into_blocking_iter(self) -> ReceiverIterator<'static, T, E> {
+    pub fn into_blocking_iter(self) -> ReceiverIterator<T, E> {
         ReceiverIterator {
             blocking: true,
-            reference: MaybeOwned::Owned(self)
+            reference: self
         }
     }
 }
 
-impl <'a, T, E> Iterator for ReceiverIterator<'a, T, E>
-where T: Send + 'static, E: Send + Sync + 'static {
+impl <T, E> Iterator for ReceiverIterator<T, E>
+where T: Send + 'static, E: Send + 'static {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         if self.blocking {
-            self.reference.borrow().recv_block()
+            self.reference.recv_block()
         } else {
-            self.reference.borrow().recv()
+            self.reference.recv()
         }
     }
 }
